@@ -5,12 +5,11 @@ const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY || '',
 });
 
-// Fallback chain for capacity limits (503 / 429)
+// Fallback chain to handle 503 (High Demand) capacity limits
 const SUPPORTED_GEMINI_MODELS = [
   'gemini-2.5-flash',
   'gemini-2.0-flash',
-  'gemini-1.5-flash',
-  'gemini-2.5-pro'
+  'gemini-1.5-flash'
 ];
 
 /**
@@ -18,38 +17,33 @@ const SUPPORTED_GEMINI_MODELS = [
  */
 function cleanAndExtractJson(text: string): string {
   if (!text) return '{}';
-  
   let cleaned = text.replace(/```(?:json)?\s*([\s\S]*?)\s*```/gi, '$1').trim();
   const firstBrace = cleaned.search(/[\{\[]/);
   const lastBrace = cleaned.search(/[\}\]][^\}\]]*$/);
-  
   if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
     cleaned = cleaned.substring(firstBrace, lastBrace + 1);
   }
-  
   return cleaned;
 }
 
 /**
- * Normalizes error messages into clean readable text instead of nested JSON strings.
+ * Normalizes nested JSON string errors from the Google SDK into readable text.
  */
-function parseErrorMessage(err: any): string {
-  if (!err) return 'An unexpected error occurred.';
+function parseGeminiError(err: any): string {
+  if (!err) return 'An unexpected AI error occurred.';
   let message = err.message || String(err);
-  
   try {
     const parsed = JSON.parse(message);
     if (parsed?.error?.message) return parsed.error.message;
     if (parsed?.message) return parsed.message;
   } catch {
-    // Keep raw string if it's not JSON
+    // If it's not JSON, just return the string
   }
-  
   return message;
 }
 
 /**
- * Handles model failover and retries on 503 (High Demand) or 429 (Rate Limit).
+ * Handles model failover.
  */
 async function callGeminiWithRetryAndFallback(prompt: string): Promise<string> {
   if (!process.env.GEMINI_API_KEY) {
@@ -59,42 +53,28 @@ async function callGeminiWithRetryAndFallback(prompt: string): Promise<string> {
   let lastErrorText = '';
 
   for (const model of SUPPORTED_GEMINI_MODELS) {
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const response = await ai.models.generateContent({
-          model,
-          contents: prompt,
-          config: {
-            responseMimeType: 'application/json',
-            temperature: 0.1,
-          },
-        });
+    try {
+      const response = await ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          temperature: 0.1,
+        },
+      });
 
-        if (response?.text) {
-          return cleanAndExtractJson(response.text);
-        }
-      } catch (err: any) {
-        lastErrorText = parseErrorMessage(err);
-        console.warn(`[Gemini Engine] Model ${model} (Attempt ${attempt}) error: ${lastErrorText}`);
-
-        const isTransient = lastErrorText.includes('503') || 
-                            lastErrorText.includes('high demand') || 
-                            lastErrorText.includes('UNAVAILABLE') || 
-                            lastErrorText.includes('429');
-
-        // If high demand spike, wait briefly before retrying or switching models
-        if (isTransient && attempt < 2) {
-          await new Promise((resolve) => setTimeout(resolve, 1500 * attempt));
-          continue;
-        }
-        
-        // Break to next model on failure
-        break;
+      if (response?.text) {
+        return cleanAndExtractJson(response.text);
       }
+    } catch (err: any) {
+      lastErrorText = parseGeminiError(err);
+      console.warn(`[Gemini API] Model ${model} failed: ${lastErrorText}. Trying fallback...`);
+      // Immediately try the next model in the array
+      continue;
     }
   }
 
-  throw new Error(`AI model experiencing high demand. Please try again in a few moments. (${lastErrorText})`);
+  throw new Error(`AI models are currently experiencing high demand. Please try again in a few seconds. Details: ${lastErrorText}`);
 }
 
 export async function processFullQAPipeline(input: RequirementInputData): Promise<FullQAPackage> {
@@ -246,39 +226,4 @@ Return a single valid JSON object matching this schema strictly without markdown
   } catch (err) {
     throw new Error('Failed to parse AI output into valid JSON.');
   }
-}
-
-export async function reviewExistingTests(requirementText: string, existingTestsContent: string): Promise<ExistingTestReviewResult> {
-  const prompt = `
-Compare existing test cases against requirement text:
-Requirement: ${requirementText}
-Existing Tests: ${existingTestsContent}
-
-Return valid JSON:
-{
-  "findings": [{"existingTestCase": "TC_01", "findingType": "Missing Edge Case", "finding": "string", "risk": "High", "recommendation": "Rewrite"}],
-  "duplicates": [{"primaryTestCase": "TC_01", "duplicateTestCases": ["TC_03"], "similarityReason": "Overlap", "action": "Merge"}]
-}
-`;
-
-  const responseText = await callGeminiWithRetryAndFallback(prompt);
-  return JSON.parse(responseText) as ExistingTestReviewResult;
-}
-
-export async function generateAutomationCode(testCase: any, framework: string): Promise<AutomationCodeResult> {
-  const prompt = `
-Generate executable ${framework} test code for:
-${JSON.stringify(testCase, null, 2)}
-
-Return valid JSON:
-{
-  "targetFramework": "${framework}",
-  "testCaseId": "${testCase.testCaseId}",
-  "code": "// Executable automated code string",
-  "setupInstructions": "npm install @playwright/test"
-}
-`;
-
-  const responseText = await callGeminiWithRetryAndFallback(prompt);
-  return JSON.parse(responseText) as AutomationCodeResult;
 }
