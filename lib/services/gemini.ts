@@ -5,23 +5,27 @@ const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY || '',
 });
 
-// Priority list of Gemini models eligible for free-tier / standard API usage
-const GEMINI_FREE_MODELS = [
-  'gemini-2.5-flash',
+// Priority list of active and supported Gemini models across 3.x and 2.x releases
+const SUPPORTED_GEMINI_MODELS = [
   'gemini-3.7-flash',
+  'gemini-3.6-flash',
+  'gemini-3.5-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-pro-preview',
+  'gemini-3.1-flash-lite',
+  'gemini-2.5-flash',
   'gemini-2.0-flash',
-  'gemini-2.0-flash-lite',
-  'gemini-1.5-pro'
+  'gemini-2.0-flash-lite'
 ];
 
 /**
  * Executes a prompt against Google Gemini with exponential backoff retries 
- * and fallback switching across all applicable Gemini free models.
+ * and fallback switching across supported Gemini models.
  */
 async function callGeminiWithRetryAndFallback(prompt: string, maxRetriesPerModel = 2): Promise<string> {
   let lastError: any = null;
 
-  for (const model of GEMINI_FREE_MODELS) {
+  for (const model of SUPPORTED_GEMINI_MODELS) {
     for (let attempt = 1; attempt <= maxRetriesPerModel; attempt++) {
       try {
         const response = await ai.models.generateContent({
@@ -40,18 +44,26 @@ async function callGeminiWithRetryAndFallback(prompt: string, maxRetriesPerModel
       } catch (error: any) {
         lastError = error;
         const statusCode = error?.status || error?.code || 500;
-        const isTransientError = statusCode === 503 || statusCode === 429 || error?.message?.includes('503');
+        const errorMessage = error?.message || '';
 
-        // Retry exponential backoff for transient 503/429 load issues
+        // If a model endpoint returns 404 NOT_FOUND, switch to next model immediately
+        if (statusCode === 404 || errorMessage.includes('404') || errorMessage.includes('not found')) {
+          console.warn(`[Gemini API] Model ${model} not accessible (404). Switching to next model...`);
+          break;
+        }
+
+        const isTransientError = statusCode === 503 || statusCode === 429 || errorMessage.includes('503');
+
+        // Exponential backoff retry for transient 503/429 rate limit or load issues
         if (isTransientError && attempt < maxRetriesPerModel) {
           const delayMs = Math.pow(2, attempt) * 1000;
-          console.warn(`[Gemini API] ${model} returned ${statusCode}. Retrying in ${delayMs / 1000}s...`);
+          console.warn(`[Gemini API] ${model} returned ${statusCode}. Retrying in ${delayMs / 1000}s (Attempt ${attempt}/${maxRetriesPerModel})...`);
           await new Promise((resolve) => setTimeout(resolve, delayMs));
           continue;
         }
 
-        // If not recoverable or retries exhausted, move to next model in array
-        console.warn(`[Gemini API] Model ${model} failed (${error?.message || statusCode}). Trying next model...`);
+        // Move to next model if retries are exhausted or non-recoverable error occurs
+        console.warn(`[Gemini API] Model ${model} failed (${errorMessage || statusCode}). Trying next model...`);
         break;
       }
     }
