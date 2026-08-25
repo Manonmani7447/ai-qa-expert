@@ -5,6 +5,58 @@ const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY || '',
 });
 
+const PRIMARY_MODEL = 'gemini-2.5-flash';
+const FALLBACK_MODEL = 'gemini-1.5-flash';
+
+/**
+ * Executes a prompt against Google Gemini with exponential backoff retries 
+ * and automatic fallback model switching for 503 / 429 server errors.
+ */
+async function callGeminiWithRetryAndFallback(prompt: string, maxRetriesPerModel = 3): Promise<string> {
+  const models = [PRIMARY_MODEL, FALLBACK_MODEL];
+
+  for (const model of models) {
+    for (let attempt = 1; attempt <= maxRetriesPerModel; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: {
+            responseMimeType: 'application/json',
+            temperature: 0.2,
+          },
+        });
+
+        if (response.text) {
+          // Clean up potential markdown JSON wrapping tags
+          return response.text.replace(/```json\n?|\n?```/g, '').trim();
+        }
+      } catch (error: any) {
+        const statusCode = error?.status || error?.code || 500;
+        const isTransientError = statusCode === 503 || statusCode === 429 || error?.message?.includes('503');
+
+        // Retry with exponential backoff if current model hits transient server load errors
+        if (isTransientError && attempt < maxRetriesPerModel) {
+          const delayMs = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s delays
+          console.warn(`[Gemini API] ${model} returned 503/429. Retrying in ${delayMs / 1000}s (Attempt ${attempt}/${maxRetriesPerModel})...`);
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          continue;
+        }
+
+        // Switch model if primary runs out of retry attempts
+        if (model === PRIMARY_MODEL) {
+          console.warn(`[Gemini API] Primary model ${PRIMARY_MODEL} unavailable. Switching to fallback ${FALLBACK_MODEL}.`);
+          break;
+        }
+
+        throw error;
+      }
+    }
+  }
+
+  throw new Error('AI service is currently experiencing high demand across all models. Please try again shortly.');
+}
+
 export async function processFullQAPipeline(input: RequirementInputData): Promise<FullQAPackage> {
   const prompt = `
 You are a Lead QA Architect & Test Automation Specialist. Perform a rigorous, deep QA evaluation of the following requirement input.
@@ -156,17 +208,8 @@ Return a valid JSON object matching this schema strictly without markdown backti
 }
 `;
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-3.7-flash',
-    contents: prompt,
-    config: {
-      responseMimeType: 'application/json',
-      temperature: 0.2,
-    },
-  });
-
-  const responseText = response.text || '{}';
-  return JSON.parse(responseText.trim()) as FullQAPackage;
+  const responseText = await callGeminiWithRetryAndFallback(prompt);
+  return JSON.parse(responseText) as FullQAPackage;
 }
 
 export async function reviewExistingTests(requirementText: string, existingTestsContent: string): Promise<ExistingTestReviewResult> {
@@ -202,16 +245,8 @@ Return JSON without backticks:
 }
 `;
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-3.7-flash',
-    contents: prompt,
-    config: {
-      responseMimeType: 'application/json',
-      temperature: 0.2,
-    },
-  });
-
-  return JSON.parse(response.text || '{}') as ExistingTestReviewResult;
+  const responseText = await callGeminiWithRetryAndFallback(prompt);
+  return JSON.parse(responseText) as ExistingTestReviewResult;
 }
 
 export async function generateAutomationCode(
@@ -236,14 +271,6 @@ Return JSON without backticks:
 }
 `;
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-3.7-flash',
-    contents: prompt,
-    config: {
-      responseMimeType: 'application/json',
-      temperature: 0.2,
-    },
-  });
-
-  return JSON.parse(response.text || '{}') as AutomationCodeResult;
+  const responseText = await callGeminiWithRetryAndFallback(prompt);
+  return JSON.parse(responseText) as AutomationCodeResult;
 }
