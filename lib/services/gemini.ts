@@ -5,15 +5,106 @@ const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY || '',
 });
 
+// Fallback chain for capacity limits (503 / 429)
+const SUPPORTED_GEMINI_MODELS = [
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+  'gemini-1.5-flash',
+  'gemini-2.5-pro'
+];
+
+/**
+ * Strips markdown fences and extracts pure JSON text.
+ */
+function cleanAndExtractJson(text: string): string {
+  if (!text) return '{}';
+  
+  let cleaned = text.replace(/```(?:json)?\s*([\s\S]*?)\s*```/gi, '$1').trim();
+  const firstBrace = cleaned.search(/[\{\[]/);
+  const lastBrace = cleaned.search(/[\}\]][^\}\]]*$/);
+  
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    cleaned = cleaned.substring(firstBrace, lastBrace + 1);
+  }
+  
+  return cleaned;
+}
+
+/**
+ * Normalizes error messages into clean readable text instead of nested JSON strings.
+ */
+function parseErrorMessage(err: any): string {
+  if (!err) return 'An unexpected error occurred.';
+  let message = err.message || String(err);
+  
+  try {
+    const parsed = JSON.parse(message);
+    if (parsed?.error?.message) return parsed.error.message;
+    if (parsed?.message) return parsed.message;
+  } catch {
+    // Keep raw string if it's not JSON
+  }
+  
+  return message;
+}
+
+/**
+ * Handles model failover and retries on 503 (High Demand) or 429 (Rate Limit).
+ */
+async function callGeminiWithRetryAndFallback(prompt: string): Promise<string> {
+  if (!process.env.GEMINI_API_KEY) {
+    throw new Error('GEMINI_API_KEY environment variable is missing.');
+  }
+
+  let lastErrorText = '';
+
+  for (const model of SUPPORTED_GEMINI_MODELS) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: {
+            responseMimeType: 'application/json',
+            temperature: 0.1,
+          },
+        });
+
+        if (response?.text) {
+          return cleanAndExtractJson(response.text);
+        }
+      } catch (err: any) {
+        lastErrorText = parseErrorMessage(err);
+        console.warn(`[Gemini Engine] Model ${model} (Attempt ${attempt}) error: ${lastErrorText}`);
+
+        const isTransient = lastErrorText.includes('503') || 
+                            lastErrorText.includes('high demand') || 
+                            lastErrorText.includes('UNAVAILABLE') || 
+                            lastErrorText.includes('429');
+
+        // If high demand spike, wait briefly before retrying or switching models
+        if (isTransient && attempt < 2) {
+          await new Promise((resolve) => setTimeout(resolve, 1500 * attempt));
+          continue;
+        }
+        
+        // Break to next model on failure
+        break;
+      }
+    }
+  }
+
+  throw new Error(`AI model experiencing high demand. Please try again in a few moments. (${lastErrorText})`);
+}
+
 export async function processFullQAPipeline(input: RequirementInputData): Promise<FullQAPackage> {
   const prompt = `
-You are a Lead QA Architect & Test Automation Specialist. Perform a rigorous, deep QA evaluation of the following requirement input.
+Act as a Lead QA Architect. Conduct a deep QA evaluation of this requirement input:
 
-Requirement Meta:
-- ID: ${input.requirementId || 'REQ-001'}
-- Application: ${input.applicationName || 'General Application'}
-- Module: ${input.moduleName || 'Core Module'}
-- Domain: ${input.businessDomain || 'Enterprise Software'}
+Requirement ID: ${input.requirementId || 'REQ-001'}
+Application: ${input.applicationName || 'General Application'}
+Module: ${input.moduleName || 'Core Module'}
+Domain: ${input.businessDomain || 'Enterprise Software'}
 
 Main Requirement Text:
 ${input.requirementText}
@@ -27,7 +118,7 @@ ${input.businessRules || 'None provided'}
 Additional Context:
 ${input.additionalContext || 'None provided'}
 
-Return a valid JSON object matching this schema strictly without markdown backticks:
+Return a single valid JSON object matching this schema strictly without markdown backticks:
 {
   "analysis": {
     "actors": ["string"],
@@ -43,11 +134,11 @@ Return a valid JSON object matching this schema strictly without markdown backti
     "expectedBehavior": ["string"],
     "postconditions": ["string"]
   },
-  "testingDimensions": ["Functional", "Negative", "Boundary", "Integration", "API", "UI", "Security", "Performance"],
+  "testingDimensions": ["Functional", "Negative", "Boundary", "Integration", "Security"],
   "gaps": [
     {
       "gapId": "GAP-001",
-      "area": "Authentication / Error Handling / Boundary",
+      "area": "Authentication / Limits",
       "gapDescription": "string",
       "riskLevel": "Critical",
       "clarificationQuestion": "string",
@@ -63,7 +154,7 @@ Return a valid JSON object matching this schema strictly without markdown backti
     "recommendedTestData": ["string"],
     "dependencies": ["string"],
     "environmentRequirements": ["string"],
-    "regressionImpact": ["string"],
+    "regressionImpact": "string",
     "recommendedAutomationStrategy": "string"
   },
   "scenarios": [
@@ -84,12 +175,12 @@ Return a valid JSON object matching this schema strictly without markdown backti
       "requirementId": "${input.requirementId || 'REQ-001'}",
       "scenarioId": "SC-001",
       "title": "string",
-      "testType": "Negative / Boundary / Functional",
+      "testType": "Functional",
       "objective": "string",
       "preconditions": ["string"],
-      "testData": {"param": "value"},
+      "testData": {"amount": 5000},
       "testSteps": ["Step 1", "Step 2"],
-      "expectedResult": "Detailed expected outcome",
+      "expectedResult": "string",
       "priority": "P1",
       "severity": "S1",
       "riskLevel": "High",
@@ -108,17 +199,17 @@ Return a valid JSON object matching this schema strictly without markdown backti
   "qualityScores": [
     {
       "testCaseId": "TC-001",
-      "overallScore": 92,
+      "overallScore": 90,
       "breakdown": {
         "traceability": 10,
         "clarity": 9,
         "completeness": 9,
         "testDataQuality": 9,
-        "stepsPrecision": 10,
+        "stepsPrecision": 9,
         "expectedResultClarity": 9,
-        "automationSuitability": 10
+        "automationSuitability": 9
       },
-      "feedback": "Clear step precision and high automation capability."
+      "feedback": "Clear steps and traceable scope."
     }
   ],
   "coverage": {
@@ -128,14 +219,7 @@ Return a valid JSON object matching this schema strictly without markdown backti
     "uncoveredRequirements": 0,
     "totalScenarios": 1,
     "totalTestCases": 1,
-    "coverageBreakdown": {
-      "positive": 40,
-      "negative": 30,
-      "boundary": 15,
-      "businessRule": 10,
-      "integration": 5,
-      "security": 0
-    },
+    "coverageBreakdown": { "positive": 50, "negative": 30, "boundary": 20 },
     "matrix": [
       {
         "requirementId": "${input.requirementId || 'REQ-001'}",
@@ -156,94 +240,45 @@ Return a valid JSON object matching this schema strictly without markdown backti
 }
 `;
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-3.7-flash',
-    contents: prompt,
-    config: {
-      responseMimeType: 'application/json',
-      temperature: 0.2,
-    },
-  });
-
-  const responseText = response.text || '{}';
-  return JSON.parse(responseText.trim()) as FullQAPackage;
+  const responseText = await callGeminiWithRetryAndFallback(prompt);
+  try {
+    return JSON.parse(responseText) as FullQAPackage;
+  } catch (err) {
+    throw new Error('Failed to parse AI output into valid JSON.');
+  }
 }
 
 export async function reviewExistingTests(requirementText: string, existingTestsContent: string): Promise<ExistingTestReviewResult> {
   const prompt = `
-Analyze the provided existing test cases against the business requirement.
-Identify duplicate tests, redundant tests, missing edge cases, poorly written steps, and gaps in risk coverage.
+Compare existing test cases against requirement text:
+Requirement: ${requirementText}
+Existing Tests: ${existingTestsContent}
 
-Requirement Context:
-${requirementText}
-
-Existing Test Suite Content:
-${existingTestsContent}
-
-Return JSON without backticks:
+Return valid JSON:
 {
-  "findings": [
-    {
-      "existingTestCase": "TC_OLD_01",
-      "findingType": "Duplicate / Missing Scenario / Poorly Written",
-      "finding": "string",
-      "risk": "High",
-      "recommendation": "Rewrite"
-    }
-  ],
-  "duplicates": [
-    {
-      "primaryTestCase": "TC_OLD_01",
-      "duplicateTestCases": ["TC_OLD_05"],
-      "similarityReason": "Exact overlap in validation logic",
-      "action": "Remove"
-    }
-  ]
+  "findings": [{"existingTestCase": "TC_01", "findingType": "Missing Edge Case", "finding": "string", "risk": "High", "recommendation": "Rewrite"}],
+  "duplicates": [{"primaryTestCase": "TC_01", "duplicateTestCases": ["TC_03"], "similarityReason": "Overlap", "action": "Merge"}]
 }
 `;
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-3.7-flash',
-    contents: prompt,
-    config: {
-      responseMimeType: 'application/json',
-      temperature: 0.2,
-    },
-  });
-
-  return JSON.parse(response.text || '{}') as ExistingTestReviewResult;
+  const responseText = await callGeminiWithRetryAndFallback(prompt);
+  return JSON.parse(responseText) as ExistingTestReviewResult;
 }
 
-export async function generateAutomationCode(
-  testCase: any,
-  framework: 'Playwright (TS)' | 'Cypress (TS)' | 'PyTest (Python)' | 'Selenium (Java)'
-): Promise<AutomationCodeResult> {
+export async function generateAutomationCode(testCase: any, framework: string): Promise<AutomationCodeResult> {
   const prompt = `
-Generate production-ready end-to-end automation test code for the following test case:
-
-Target Framework: ${framework}
-Test Case Details:
+Generate executable ${framework} test code for:
 ${JSON.stringify(testCase, null, 2)}
 
-Provide structured implementation code following page object model patterns where appropriate, with assertions, error catching, and test data setup.
-
-Return JSON without backticks:
+Return valid JSON:
 {
   "targetFramework": "${framework}",
   "testCaseId": "${testCase.testCaseId}",
-  "code": "executable test code string",
-  "setupInstructions": "instructions on dependencies and runner execution"
+  "code": "// Executable automated code string",
+  "setupInstructions": "npm install @playwright/test"
 }
 `;
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-3.7-flash',
-    contents: prompt,
-    config: {
-      responseMimeType: 'application/json',
-      temperature: 0.2,
-    },
-  });
-
-  return JSON.parse(response.text || '{}') as AutomationCodeResult;
+  const responseText = await callGeminiWithRetryAndFallback(prompt);
+  return JSON.parse(responseText) as AutomationCodeResult;
 }
