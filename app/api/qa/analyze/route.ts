@@ -14,17 +14,17 @@ export async function POST(req: Request) {
 
     const result = await processFullQAPipeline(body);
     return NextResponse.json(result);
+    
   } catch (error: any) {
     console.error('[API Error /api/qa/analyze]:', error);
 
+    // Final safety net: Ensure the error string is clean before sending to client
     let cleanErrorMessage = error?.message || 'An error occurred while processing the requirement.';
-    
-    // Parse nested JSON strings if present
     try {
       const parsed = JSON.parse(cleanErrorMessage);
       cleanErrorMessage = parsed?.error?.message || parsed?.message || cleanErrorMessage;
     } catch {
-      // Keep as standard string
+      // Ignore if it's already a clean string
     }
 
     return NextResponse.json(
