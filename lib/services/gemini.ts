@@ -5,89 +5,6 @@ const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY || '',
 });
 
-// Priority list of verified, active Gemini API models
-const SUPPORTED_GEMINI_MODELS = [
-  'gemini-2.5-flash',
-  'gemini-2.5-pro',
-  'gemini-2.0-flash',
-  'gemini-2.0-flash-lite'
-];
-
-/**
- * Extracts and cleans JSON text from model responses.
- */
-function cleanAndExtractJson(text: string): string {
-  if (!text) return '{}';
-  
-  // Strip markdown code fences (e.g., ```json ... ```)
-  let cleaned = text.replace(/```(?:json)?\s*([\s\S]*?)\s*```/gi, '$1').trim();
-  
-  // Extract JSON object or array bounds if extra text exists
-  const firstBrace = cleaned.search(/[\{\[]/);
-  const lastBrace = cleaned.search(/[\}\]][^\}\]]*$/);
-  
-  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-    cleaned = cleaned.substring(firstBrace, lastBrace + 1);
-  }
-  
-  return cleaned;
-}
-
-/**
- * Executes a prompt against Google Gemini with retries and model fallbacks.
- */
-async function callGeminiWithRetryAndFallback(prompt: string, maxRetriesPerModel = 2): Promise<string> {
-  let lastError: any = null;
-
-  if (!process.env.GEMINI_API_KEY) {
-    throw new Error('GEMINI_API_KEY is not set in environment variables.');
-  }
-
-  for (const model of SUPPORTED_GEMINI_MODELS) {
-    for (let attempt = 1; attempt <= maxRetriesPerModel; attempt++) {
-      try {
-        const response = await ai.models.generateContent({
-          model,
-          contents: prompt,
-          config: {
-            responseMimeType: 'application/json',
-            temperature: 0.2,
-          },
-        });
-
-        if (response.text) {
-          return cleanAndExtractJson(response.text);
-        }
-      } catch (error: any) {
-        lastError = error;
-        const statusCode = error?.status || error?.code || 500;
-        const errorMessage = error?.message || '';
-
-        // Model not found (404) -> Skip immediately to next model
-        if (statusCode === 404 || errorMessage.includes('404') || errorMessage.includes('not found')) {
-          console.warn(`[Gemini API] Model ${model} returned 404. Skipping to next model...`);
-          break;
-        }
-
-        const isTransientError = statusCode === 503 || statusCode === 429 || errorMessage.includes('503');
-
-        // Exponential backoff retry for rate limits or server load spikes
-        if (isTransientError && attempt < maxRetriesPerModel) {
-          const delayMs = Math.pow(2, attempt) * 1000;
-          console.warn(`[Gemini API] ${model} returned ${statusCode}. Retrying in ${delayMs / 1000}s...`);
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
-          continue;
-        }
-
-        console.warn(`[Gemini API] Model ${model} failed (${errorMessage || statusCode}). Trying next model...`);
-        break;
-      }
-    }
-  }
-
-  throw new Error(`Gemini execution failed: ${lastError?.message || 'All models unavailable'}`);
-}
-
 export async function processFullQAPipeline(input: RequirementInputData): Promise<FullQAPackage> {
   const prompt = `
 You are a Lead QA Architect & Test Automation Specialist. Perform a rigorous, deep QA evaluation of the following requirement input.
@@ -239,12 +156,17 @@ Return a valid JSON object matching this schema strictly without markdown backti
 }
 `;
 
-  const responseText = await callGeminiWithRetryAndFallback(prompt);
-  try {
-    return JSON.parse(responseText) as FullQAPackage;
-  } catch (err) {
-    throw new Error(`Failed to parse AI response as JSON: ${responseText.slice(0, 100)}...`);
-  }
+  const response = await ai.models.generateContent({
+    model: 'gemini-2.5-flash',
+    contents: prompt,
+    config: {
+      responseMimeType: 'application/json',
+      temperature: 0.2,
+    },
+  });
+
+  const responseText = response.text || '{}';
+  return JSON.parse(responseText.trim()) as FullQAPackage;
 }
 
 export async function reviewExistingTests(requirementText: string, existingTestsContent: string): Promise<ExistingTestReviewResult> {
@@ -280,12 +202,16 @@ Return JSON without backticks:
 }
 `;
 
-  const responseText = await callGeminiWithRetryAndFallback(prompt);
-  try {
-    return JSON.parse(responseText) as ExistingTestReviewResult;
-  } catch (err) {
-    throw new Error(`Failed to parse test review JSON: ${responseText.slice(0, 100)}...`);
-  }
+  const response = await ai.models.generateContent({
+    model: 'gemini-2.5-flash',
+    contents: prompt,
+    config: {
+      responseMimeType: 'application/json',
+      temperature: 0.2,
+    },
+  });
+
+  return JSON.parse(response.text || '{}') as ExistingTestReviewResult;
 }
 
 export async function generateAutomationCode(
@@ -310,10 +236,14 @@ Return JSON without backticks:
 }
 `;
 
-  const responseText = await callGeminiWithRetryAndFallback(prompt);
-  try {
-    return JSON.parse(responseText) as AutomationCodeResult;
-  } catch (err) {
-    throw new Error(`Failed to parse automation code JSON: ${responseText.slice(0, 100)}...`);
-  }
+  const response = await ai.models.generateContent({
+    model: 'gemini-2.5-flash',
+    contents: prompt,
+    config: {
+      responseMimeType: 'application/json',
+      temperature: 0.2,
+    },
+  });
+
+  return JSON.parse(response.text || '{}') as AutomationCodeResult;
 }
