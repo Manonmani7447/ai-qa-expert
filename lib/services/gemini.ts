@@ -5,17 +5,23 @@ const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY || '',
 });
 
-const PRIMARY_MODEL = 'gemini-2.5-flash';
-const FALLBACK_MODEL = 'gemini-1.5-flash';
+// Priority list of Gemini models eligible for free-tier / standard API usage
+const GEMINI_FREE_MODELS = [
+  'gemini-2.5-flash',
+  'gemini-3.7-flash',
+  'gemini-2.0-flash',
+  'gemini-2.0-flash-lite',
+  'gemini-1.5-pro'
+];
 
 /**
  * Executes a prompt against Google Gemini with exponential backoff retries 
- * and automatic fallback model switching for 503 / 429 server errors.
+ * and fallback switching across all applicable Gemini free models.
  */
-async function callGeminiWithRetryAndFallback(prompt: string, maxRetriesPerModel = 3): Promise<string> {
-  const models = [PRIMARY_MODEL, FALLBACK_MODEL];
+async function callGeminiWithRetryAndFallback(prompt: string, maxRetriesPerModel = 2): Promise<string> {
+  let lastError: any = null;
 
-  for (const model of models) {
+  for (const model of GEMINI_FREE_MODELS) {
     for (let attempt = 1; attempt <= maxRetriesPerModel; attempt++) {
       try {
         const response = await ai.models.generateContent({
@@ -28,33 +34,30 @@ async function callGeminiWithRetryAndFallback(prompt: string, maxRetriesPerModel
         });
 
         if (response.text) {
-          // Clean up potential markdown JSON wrapping tags
+          // Clean up potential markdown JSON backticks
           return response.text.replace(/```json\n?|\n?```/g, '').trim();
         }
       } catch (error: any) {
+        lastError = error;
         const statusCode = error?.status || error?.code || 500;
         const isTransientError = statusCode === 503 || statusCode === 429 || error?.message?.includes('503');
 
-        // Retry with exponential backoff if current model hits transient server load errors
+        // Retry exponential backoff for transient 503/429 load issues
         if (isTransientError && attempt < maxRetriesPerModel) {
-          const delayMs = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s delays
-          console.warn(`[Gemini API] ${model} returned 503/429. Retrying in ${delayMs / 1000}s (Attempt ${attempt}/${maxRetriesPerModel})...`);
+          const delayMs = Math.pow(2, attempt) * 1000;
+          console.warn(`[Gemini API] ${model} returned ${statusCode}. Retrying in ${delayMs / 1000}s...`);
           await new Promise((resolve) => setTimeout(resolve, delayMs));
           continue;
         }
 
-        // Switch model if primary runs out of retry attempts
-        if (model === PRIMARY_MODEL) {
-          console.warn(`[Gemini API] Primary model ${PRIMARY_MODEL} unavailable. Switching to fallback ${FALLBACK_MODEL}.`);
-          break;
-        }
-
-        throw error;
+        // If not recoverable or retries exhausted, move to next model in array
+        console.warn(`[Gemini API] Model ${model} failed (${error?.message || statusCode}). Trying next model...`);
+        break;
       }
     }
   }
 
-  throw new Error('AI service is currently experiencing high demand across all models. Please try again shortly.');
+  throw new Error(`All Gemini models failed. Last error: ${lastError?.message || 'Server unavailable'}`);
 }
 
 export async function processFullQAPipeline(input: RequirementInputData): Promise<FullQAPackage> {
